@@ -1,0 +1,296 @@
+name: macOS CI
+
+# 一個可以在任何 repo 直接用的 macOS 工作流程。
+# GitHub 免費額度內的 macOS runner（Apple 硬件，真 macOS）。
+#
+# 用法：把這個檔複製到目標 repo 的 .github/workflows/ 之下，push 即可。
+# 三種 profile 任選（可同時跑）：
+#   node   → pnpm/npm 安裝、lint、test、build
+#   python → pip 安裝、pytest（無 tests 就只做 import 檢查）
+#   jvm    → Gradle build（Kotlin/Java/Compose Desktop），可另存 dmg/zip
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: '要跑哪一種（node / python / jvm / all）'
+        required: true
+        default: node
+        type: choice
+        options: [node, python, jvm, all]
+      runner_arch:
+        description: 'Apple Silicon (arm64) 或 Intel (x64)'
+        required: true
+        default: arm64
+        type: choice
+        options: [arm64, x64]
+  push:
+    branches: [main, ci/macos-workflow]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-ci-${{ github.ref }}-${{ github.event.inputs.runner_arch || 'arm64' }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+  PYTHON_VERSION: '3.12'
+  JAVA_VERSION: '17'
+
+jobs:
+  # ------------------------------------------------- 環境自證（永遠執行）
+  runner:
+    name: Runner info (proof)
+    runs-on: ${{ (github.event.inputs.runner_arch == 'x64') && 'macos-26-intel' || 'macos-26' }}
+    timeout-minutes: 15
+    steps:
+      - name: Show macOS / hardware / toolchain
+        run: |
+          echo "=== sw_vers ==="; sw_vers
+          echo "=== uname ==="; uname -a
+          echo "=== arch ==="; uname -m
+          echo "=== CPU ==="; sysctl -n machdep.cpu.brand_string 2>/dev/null || sysctl -n hw.model
+          echo "=== Xcode CLT ==="; xcodebuild -version 2>/dev/null || echo "xcodebuild not installed"
+          echo "=== toolchains ==="
+          for t in git node npm python3 java xcrun swift; do
+            printf '%-8s ' "$t"; command -v "$t" >/dev/null 2>&1 && "$t" --version 2>&1 | head -1 || echo "missing"
+          done
+          echo "=== disk ==="; df -h /
+
+      - name: Login session proof
+        run: |
+          echo "=== logged-in user ==="
+          whoami
+          id
+          echo "=== active sessions ==="
+          who || true
+          echo "=== host ==="
+          hostname
+          uptime
+          echo "MACOS LOGIN OK: $(whoami) @ macOS $(sw_vers -productVersion) ($(uname -m))"
+
+      - name: Graphical session proof
+        run: |
+          echo "=== console user (macOS 自己的答案) ==="
+          stat -f%Su /dev/console
+          echo "=== GUI (Aqua) session ==="
+          launchctl print gui/$(id -u) 2>&1 | head -12 || echo "no gui session"
+          echo "=== WindowServer ==="
+          if pgrep -x WindowServer >/dev/null; then echo "WindowServer RUNNING (pid $(pgrep -x WindowServer))"; else echo "WindowServer NOT running"; fi
+          echo "=== loginwindow ==="
+          if pgrep -x loginwindow >/dev/null; then echo "loginwindow RUNNING (pid $(pgrep -x loginwindow))"; else echo "loginwindow NOT running"; fi
+          echo "=== displays ==="
+          system_profiler SPDisplaysDataType 2>/dev/null | sed -n '1,12p'
+
+  # ---------------------------------------------------------------- Node
+  node:
+    name: Node (macOS ${{ github.event.inputs.runner_arch || 'arm64' }})
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.profile == 'node' || inputs.profile == 'all' }}
+    runs-on: ${{ (github.event.inputs.runner_arch == 'x64') && 'macos-26-intel' || 'macos-26' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+        continue-on-error: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+        continue-on-error: true
+
+      - name: Fallback to npm if no pnpm-lock
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "PKG=pnpm" >> "$GITHUB_ENV"
+          else
+            echo "PKG=npm" >> "$GITHUB_ENV"
+          fi
+
+      - name: Detect Node project
+        id: detect
+        run: |
+          if [ -f package.json ]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+            echo "no package.json — skip Node build steps"
+          fi
+
+      - name: Install
+        if: steps.detect.outputs.has == 'true'
+        run: |
+          if [ "$PKG" = "pnpm" ]; then pnpm install --frozen-lockfile; else npm ci || npm install; fi
+
+      - name: Lint
+        if: steps.detect.outputs.has == 'true'
+        run: |
+          if [ "$PKG" = "pnpm" ]; then pnpm run --if-present lint; else npm run --if-present lint; fi
+
+      - name: Test
+        if: steps.detect.outputs.has == 'true'
+        run: |
+          if [ "$PKG" = "pnpm" ]; then pnpm run --if-present test; else npm run --if-present test; fi
+
+      - name: Build
+        if: steps.detect.outputs.has == 'true'
+        run: |
+          if [ "$PKG" = "pnpm" ]; then pnpm run --if-present build; else npm run --if-present build; fi
+
+      - name: Collect artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-artifacts-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            dist/
+            build/
+            release/
+            *.dmg
+            *.zip
+
+  # -------------------------------------------------------------- Python
+  python:
+    name: Python (macOS ${{ github.event.inputs.runner_arch || 'arm64' }})
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.profile == 'python' || inputs.profile == 'all' }}
+    runs-on: ${{ (github.event.inputs.runner_arch == 'x64') && 'macos-26-intel' || 'macos-26' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+        continue-on-error: true
+
+      - name: Detect Python project
+        id: detect
+        run: |
+          if [ -f pyproject.toml ] || [ -f setup.py ] || [ -f requirements.txt ] \
+             || [ -d tests ] || ls *.py >/dev/null 2>&1; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+            echo "no Python project files — skip Python steps"
+          fi
+
+      - name: Install
+        if: steps.detect.outputs.has == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f pyproject.toml ]; then pip install -e .; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest
+
+      - name: Test
+        if: steps.detect.outputs.has == 'true'
+        run: |
+          # 只跑根目錄的測試，避免把子專案（各自的依賴）一併收集。
+          args=""
+          if [ -d tests ]; then args="tests"; fi
+          for f in test_*.py; do [ -e "$f" ] && args="$args $f"; done
+          if [ -n "$args" ]; then
+            pytest -q $args
+          else
+            echo "no tests; running import smoke check"
+            printf '%s\n' \
+              'import importlib, pathlib' \
+              'names = [p.parent.name for p in pathlib.Path(".").glob("*/__init__.py")]' \
+              'ok = 0' \
+              'for n in names:' \
+              '    if n.startswith(("_", ".")):' \
+              '        continue' \
+              '    try:' \
+              '        importlib.import_module(n); ok += 1' \
+              '    except Exception as e:' \
+              '        print(f"skip {n}: {e}")' \
+              'print(f"imported {ok} packages on macOS")' \
+              > /tmp/smoke.py
+            python /tmp/smoke.py
+          fi
+
+      - name: Build wheel + sdist
+        if: steps.detect.outputs.has == 'true'
+        run: |
+          python -m pip install --upgrade build
+          python -m build --sdist --wheel --outdir dist
+          ls -lh dist
+
+      - name: Upload python dist
+        if: steps.detect.outputs.has == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 7
+          path: dist/*
+
+  # ----------------------------------------------------------------- JVM
+  jvm:
+    name: JVM (macOS ${{ github.event.inputs.runner_arch || 'arm64' }})
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.profile == 'jvm' || inputs.profile == 'all' }}
+    runs-on: ${{ (github.event.inputs.runner_arch == 'x64') && 'macos-26-intel' || 'macos-26' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10'
+
+      - name: Detect Gradle project
+        id: detect
+        run: |
+          cmd=""
+          if [ -f ./gradlew ]; then
+            cmd="./gradlew"
+          elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            cmd="gradle"
+          fi
+          if [ -n "$cmd" ]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+            echo "gradle_cmd=$cmd" >> "$GITHUB_OUTPUT"
+            echo "using $cmd"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+            echo "no gradlew / build.gradle — skip JVM build steps"
+          fi
+
+      - name: Build
+        if: steps.detect.outputs.has == 'true'
+        run: ${{ steps.detect.outputs.gradle_cmd }} build --no-daemon --stacktrace
+
+      - name: Package (dmg / dist)
+        if: steps.detect.outputs.has == 'true'
+        continue-on-error: true
+        run: |
+          ${{ steps.detect.outputs.gradle_cmd }} packageDmg --no-daemon || \
+          ${{ steps.detect.outputs.gradle_cmd }} packageDistributionForCurrentOS --no-daemon || \
+          ${{ steps.detect.outputs.gradle_cmd }} assemble --no-daemon
+
+      - name: Collect artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-artifacts-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            **/build/compose/binaries/**/*.dmg
+            **/build/compose/binaries/**/*.zip
+            **/build/libs/*.jar
